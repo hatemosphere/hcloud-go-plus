@@ -1,0 +1,122 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # ── defaults ──────────────────────────────────────────────────────────
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+
+    # ── bug / correctness ────────────────────────────────────────────────
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - durationcheck
+    - errname
+    - errorlint
+    - fatcontext
+    - intrange
+    - makezero
+    - nilerr
+    # nilnil: we intentionally return (nil, nil) from GetByID on 404 to
+    # match hcloud-go's Get* convention. Keep it off.
+    - noctx
+    - reassign
+    - rowserrcheck
+    - sqlclosecheck
+    - wastedassign
+    - usetesting
+
+    # ── style / readability ──────────────────────────────────────────────
+    - gocritic
+    - misspell
+    - nestif
+    - predeclared
+    - unconvert
+    - unparam
+    - whitespace
+
+    # ── performance ──────────────────────────────────────────────────────
+    - perfsprint
+    - prealloc
+
+    # ── security ─────────────────────────────────────────────────────────
+    - gosec
+
+    # ── minor ────────────────────────────────────────────────────────────
+    - goconst
+    - gochecknoinits
+    - nolintlint
+
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - opinionated
+      disabled-checks:
+        # We already have comments where they matter; no blanket "add Doc"
+        # nag.
+        - commentFormatting
+        # Off-by-one opinion; our time math is intentional.
+        - ifElseChain
+      settings:
+        hugeParam:
+          # Options structs follow the hcloud-go convention of value
+          # receivers / value args. 256 keeps that while still catching
+          # genuinely oversized types.
+          sizeThreshold: 256
+
+    gosec:
+      excludes:
+        # G404: weak RNG is fine for unique test-project name suffixes.
+        - G404
+
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment is aggressive memory-layout reordering that hurts
+        # struct readability for negligible savings on our workloads.
+        - fieldalignment
+        # shadow fires on idiomatic `err := ...; if err := ...` patterns.
+        - shadow
+
+    nestif:
+      min-complexity: 6
+
+    staticcheck:
+      checks:
+        - all
+
+  exclusions:
+    generated: lax
+    presets:
+      - common-false-positives
+      - legacy
+    rules:
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - goconst
+          - gosec
+          - nestif
+          - noctx
+          - unparam
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/hatemosphere/hcloud-go-plus

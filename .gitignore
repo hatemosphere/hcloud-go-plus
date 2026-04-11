@@ -1,0 +1,32 @@
+# reference checkouts — cloned repos we read but do not ship
+reference/
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+/bin/
+/dist/
+/vendor/
+
+# Go workspace sum file (go.work itself is committed)
+go.work.sum
+
+# IDE / editor junk
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local env files — never commit secrets
+.env
+.env.*
+!.env.example
+
+# AI
+.claude/
