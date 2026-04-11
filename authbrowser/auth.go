@@ -170,22 +170,57 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		return "", time.Time{}, fmt.Errorf("authbrowser: TOTP field not found (is the account using Yubikey OTP instead of TOTP?): %w", err)
 	}
 
-	code, err := creds.TOTP(ctx)
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("authbrowser: TOTP callback: %w", err)
+	// Retry TOTP up to maxTOTPAttempts times. Hetzner sometimes re-renders
+	// the form with an empty input when a code lands on the wrong side of
+	// a 30-second window boundary — we generated the code just before the
+	// rollover, and by the time the server processed it the code had
+	// already expired. Retrying with a freshly-generated code from the
+	// callback fixes it.
+	const maxTOTPAttempts = 3
+	totpAccepted := false
+	for attempt := 1; attempt <= maxTOTPAttempts; attempt++ {
+		code, err := creds.TOTP(ctx)
+		if err != nil {
+			return "", time.Time{}, fmt.Errorf("authbrowser: TOTP callback: %w", err)
+		}
+		code = strings.TrimSpace(code)
+		if code == "" {
+			return "", time.Time{}, errors.New("authbrowser: TOTP callback returned empty code")
+		}
+
+		// Clear any leftover value from a previous rejected attempt before
+		// typing the new code.
+		if err := totpEl.SelectAllText(); err == nil {
+			_ = totpEl.Input("")
+		}
+		if err := totpEl.Input(code); err != nil {
+			return "", time.Time{}, fmt.Errorf("authbrowser: input TOTP: %w", err)
+		}
+		if err := clickSubmit(page); err != nil {
+			return "", time.Time{}, fmt.Errorf("authbrowser: submit TOTP: %w", err)
+		}
+		if o.debug != nil {
+			fmt.Fprintf(o.debug, "[authbrowser] submitted TOTP (attempt %d/%d)\n", attempt, maxTOTPAttempts)
+		}
+
+		// Success = we leave accounts.hetzner.com. Give it a short window.
+		if err := waitForHostChange(ctx, page, "accounts.hetzner.com", 8*time.Second); err == nil {
+			totpAccepted = true
+			break
+		}
+
+		if o.debug != nil {
+			fmt.Fprintf(o.debug, "[authbrowser] TOTP attempt %d rejected (still on accounts.hetzner.com)\n", attempt)
+		}
+		// Re-acquire the TOTP element — Hetzner may have re-rendered the
+		// form with a new DOM node, invalidating the old handle.
+		totpEl, err = page.Element(`input[name="_auth_code"]`)
+		if err != nil {
+			return "", time.Time{}, fmt.Errorf("authbrowser: after TOTP submit, neither redirected nor TOTP form present: %w", err)
+		}
 	}
-	code = strings.TrimSpace(code)
-	if code == "" {
-		return "", time.Time{}, errors.New("authbrowser: TOTP callback returned empty code")
-	}
-	if err := totpEl.Input(code); err != nil {
-		return "", time.Time{}, fmt.Errorf("authbrowser: input TOTP: %w", err)
-	}
-	if err := clickSubmit(page); err != nil {
-		return "", time.Time{}, fmt.Errorf("authbrowser: submit TOTP: %w", err)
-	}
-	if o.debug != nil {
-		fmt.Fprintln(o.debug, "[authbrowser] submitted TOTP")
+	if !totpAccepted {
+		return "", time.Time{}, fmt.Errorf("authbrowser: TOTP rejected after %d attempts — verify the TOTP callback produces a current valid code", maxTOTPAttempts)
 	}
 
 	// After TOTP, the browser redirects to console.hetzner.com/ with the
@@ -225,6 +260,37 @@ func clickSubmit(page *rod.Page) error {
 		return err
 	}
 	return btn.Click(proto.InputMouseButtonLeft, 1)
+}
+
+// waitForHostChange polls page.Info().URL until its host no longer
+// contains `fromHost` (i.e. the page has navigated away), or returns an
+// error on timeout. Used to detect "did the form submission succeed"
+// without relying on content selectors that vary between error states.
+func waitForHostChange(ctx context.Context, page *rod.Page, fromHost string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("authbrowser: did not leave %s within %s", fromHost, timeout)
+		}
+		info, err := page.Info()
+		if err != nil || info == nil {
+			continue
+		}
+		u, perr := url.Parse(info.URL)
+		if perr != nil {
+			continue
+		}
+		if !strings.Contains(u.Host, fromHost) {
+			return nil
+		}
+	}
 }
 
 // pollForTokenCookie repeatedly reads the browser's cookies for the console
