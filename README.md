@@ -115,6 +115,14 @@ HCGP_USER_TOKEN=… go test -tags=integration -race ./hcloudplus/
 Integration tests only operate on projects whose name starts with `hcgp-it-`
 and refuse to delete anything else. Paranoid by design.
 
+## Downstream
+
+- [**terraform-provider-hcloudplus**](https://github.com/hatemosphere/terraform-provider-hcloudplus)
+  — Terraform provider built on this library. Drop-in companion to the
+  official `hetznercloud/terraform-provider-hcloud`.
+- **pulumi-hcloudplus** (planned) — Pulumi provider via the
+  `pulumi-terraform-bridge` once the TF provider hits v0.1.
+
 ## Status
 
 v0. Works. Not yet tagged. See `docs/private-api.md` for the TODO list of
