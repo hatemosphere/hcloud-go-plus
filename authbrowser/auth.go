@@ -170,14 +170,33 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		return "", time.Time{}, fmt.Errorf("authbrowser: TOTP field not found (is the account using Yubikey OTP instead of TOTP?): %w", err)
 	}
 
-	// Retry TOTP up to maxTOTPAttempts times. Hetzner sometimes re-renders
-	// the form with an empty input when a code lands on the wrong side of
-	// a 30-second window boundary — we generated the code just before the
-	// rollover, and by the time the server processed it the code had
-	// already expired. Retrying with a freshly-generated code from the
-	// callback fixes it.
-	const maxTOTPAttempts = 3
+	// Retry TOTP up to maxTOTPAttempts times. There are two failure modes
+	// we want to survive:
+	//
+	//  1. The code we generated lands on the wrong side of the 30-second
+	//     TOTP window boundary by the time Hetzner processes it. Retrying
+	//     with a fresh code fixes it — but only if the callback returns a
+	//     *new* code. Most secret managers (1Password, pass-otp, ykman)
+	//     generate deterministically from the seed + current time, so
+	//     repeated calls inside the same 30s window return the same code.
+	//     To avoid pounding the same rejected code three times in a row,
+	//     we compare the newly-fetched code against the one we last
+	//     submitted; if they match, we wait in small ticks (re-checking
+	//     up to ~35s) until the generator starts returning a different
+	//     code, signalling a new window.
+	//
+	//  2. Transient form state: after a rejected submit, Hetzner may
+	//     briefly disable the submit button (pointer-events: none) while
+	//     it re-renders. We catch this with a bounded wait on the
+	//     submit button's clickability before each click.
+	const (
+		maxTOTPAttempts      = 3
+		waitNewCodeTimeout   = 35 * time.Second
+		waitNewCodePoll      = 2 * time.Second
+		submitButtonReadyTmt = 5 * time.Second
+	)
 	totpAccepted := false
+	var lastCode string
 	for attempt := 1; attempt <= maxTOTPAttempts; attempt++ {
 		code, err := creds.TOTP(ctx)
 		if err != nil {
@@ -188,6 +207,35 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 			return "", time.Time{}, errors.New("authbrowser: TOTP callback returned empty code")
 		}
 
+		// On retry, if the callback returned the same code we just
+		// submitted, wait for the next 30s window before trying again.
+		// Otherwise we'd burn attempts on an already-rejected code.
+		if attempt > 1 && code == lastCode {
+			if o.debug != nil {
+				fmt.Fprintln(o.debug, "[authbrowser] TOTP callback returned same code as previous attempt; waiting for next window")
+			}
+			waitDeadline := time.Now().Add(waitNewCodeTimeout)
+			for time.Now().Before(waitDeadline) {
+				select {
+				case <-ctx.Done():
+					return "", time.Time{}, ctx.Err()
+				case <-time.After(waitNewCodePoll):
+				}
+				next, err := creds.TOTP(ctx)
+				if err != nil {
+					return "", time.Time{}, fmt.Errorf("authbrowser: TOTP callback: %w", err)
+				}
+				next = strings.TrimSpace(next)
+				if next != "" && next != lastCode {
+					code = next
+					break
+				}
+			}
+			if code == lastCode {
+				return "", time.Time{}, fmt.Errorf("authbrowser: TOTP callback kept returning the same code %q for %s — check that the backing secret manager is actually rolling windows", lastCode, waitNewCodeTimeout)
+			}
+		}
+
 		// Clear any leftover value from a previous rejected attempt before
 		// typing the new code.
 		if err := totpEl.SelectAllText(); err == nil {
@@ -196,9 +244,16 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		if err := totpEl.Input(code); err != nil {
 			return "", time.Time{}, fmt.Errorf("authbrowser: input TOTP: %w", err)
 		}
+		// Wait for the submit button to be clickable — after a rejected
+		// submission Hetzner temporarily disables it (pointer-events: none)
+		// while re-rendering the form.
+		if err := waitForClickableSubmit(page, submitButtonReadyTmt); err != nil {
+			return "", time.Time{}, fmt.Errorf("authbrowser: submit button never became clickable: %w", err)
+		}
 		if err := clickSubmit(page); err != nil {
 			return "", time.Time{}, fmt.Errorf("authbrowser: submit TOTP: %w", err)
 		}
+		lastCode = code
 		if o.debug != nil {
 			fmt.Fprintf(o.debug, "[authbrowser] submitted TOTP (attempt %d/%d)\n", attempt, maxTOTPAttempts)
 		}
@@ -260,6 +315,31 @@ func clickSubmit(page *rod.Page) error {
 		return err
 	}
 	return btn.Click(proto.InputMouseButtonLeft, 1)
+}
+
+// waitForClickableSubmit blocks until `button[type="submit"]` has
+// `pointer-events: auto` (i.e. is actually clickable) or the timeout
+// elapses. Hetzner briefly sets pointer-events: none on the submit
+// button after a rejected TOTP while it re-renders the form, and
+// clicking during that window returns "element's pointer-events is none"
+// from rod — hence this pre-flight check on retries.
+func waitForClickableSubmit(page *rod.Page, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	tick := time.NewTicker(150 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("authbrowser: submit button still disabled after %s", timeout)
+		}
+		el, err := page.Element(`button[type="submit"]`)
+		if err == nil {
+			pe, evalErr := el.Eval(`() => getComputedStyle(this).pointerEvents`)
+			if evalErr == nil && pe != nil && pe.Value.Str() != "none" {
+				return nil
+			}
+		}
+		<-tick.C
+	}
 }
 
 // waitForHostChange polls page.Info().URL until its host no longer
