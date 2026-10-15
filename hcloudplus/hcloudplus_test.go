@@ -143,10 +143,12 @@ func TestProjectGetNotFound(t *testing.T) {
 
 func TestInvitationLifecycle(t *testing.T) {
 	env := newTestEnv(t)
+	env.Client.puCache[10] = &projectUserToken{secret: "pu-secret", expires: time.Now().Add(1 * time.Hour)}
 	env.Mux.HandleFunc("/_projects/10/invitations", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s", r.Method)
 		}
+		assertBearer(t, r, "pu-secret")
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body["email"] != "x@y" || body["role"] != "member" {
@@ -159,12 +161,14 @@ func TestInvitationLifecycle(t *testing.T) {
 		if r.Method != http.MethodPut {
 			t.Errorf("resend method = %s, want PUT", r.Method)
 		}
+		assertBearer(t, r, "pu-secret")
 		w.WriteHeader(http.StatusNoContent)
 	})
 	env.Mux.HandleFunc("/_projects/10/invitations/7", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			t.Errorf("delete method = %s", r.Method)
 		}
+		assertBearer(t, r, "pu-secret")
 		w.WriteHeader(http.StatusNoContent)
 	})
 

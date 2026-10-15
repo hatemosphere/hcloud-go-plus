@@ -35,10 +35,11 @@ func (c ProjectInvitationClient) List(ctx context.Context, projectID int64, opts
 		Meta               Meta                 `json:"meta"`
 	}
 	err := c.client.do(ctx, request{
-		method: http.MethodGet,
-		path:   fmt.Sprintf("/_projects/%d/invitations", projectID),
-		query:  opts.values(),
-		auth:   authUser,
+		method:    http.MethodGet,
+		path:      fmt.Sprintf("/_projects/%d/invitations", projectID),
+		query:     opts.values(),
+		auth:      authProjectUser,
+		projectID: projectID,
 	}, &body)
 	if err != nil {
 		return nil, nil, err
@@ -93,10 +94,11 @@ func (c ProjectInvitationClient) Create(ctx context.Context, projectID int64, op
 		ProjectInvitation *ProjectInvitation `json:"project_invitation"`
 	}
 	err := c.client.do(ctx, request{
-		method: http.MethodPost,
-		path:   fmt.Sprintf("/_projects/%d/invitations", projectID),
-		body:   reqBody,
-		auth:   authUser,
+		method:    http.MethodPost,
+		path:      fmt.Sprintf("/_projects/%d/invitations", projectID),
+		body:      reqBody,
+		auth:      authProjectUser,
+		projectID: projectID,
 	}, &body)
 	if err != nil {
 		return nil, err
@@ -109,9 +111,10 @@ func (c ProjectInvitationClient) Create(ctx context.Context, projectID int64, op
 // Note: the private API uses PUT for this action, not POST.
 func (c ProjectInvitationClient) Resend(ctx context.Context, projectID, invitationID int64) error {
 	err := c.client.do(ctx, request{
-		method: http.MethodPut,
-		path:   fmt.Sprintf("/_projects/%d/invitations/%d/resend", projectID, invitationID),
-		auth:   authUser,
+		method:    http.MethodPut,
+		path:      fmt.Sprintf("/_projects/%d/invitations/%d/resend", projectID, invitationID),
+		auth:      authProjectUser,
+		projectID: projectID,
 	}, nil)
 	return err
 }
@@ -119,9 +122,10 @@ func (c ProjectInvitationClient) Resend(ctx context.Context, projectID, invitati
 // Delete revokes a pending invitation. Server responds 204.
 func (c ProjectInvitationClient) Delete(ctx context.Context, projectID, invitationID int64) error {
 	err := c.client.do(ctx, request{
-		method: http.MethodDelete,
-		path:   fmt.Sprintf("/_projects/%d/invitations/%d", projectID, invitationID),
-		auth:   authUser,
+		method:    http.MethodDelete,
+		path:      fmt.Sprintf("/_projects/%d/invitations/%d", projectID, invitationID),
+		auth:      authProjectUser,
+		projectID: projectID,
 	}, nil)
 	return err
 }

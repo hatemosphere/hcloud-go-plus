@@ -51,7 +51,7 @@ Response: 204 no body
 ## Project members
 
 ### `GET /v1/_projects/:id/users` — list accepted members
-Auth: user
+Auth: **project_user** (403 with user token since ~Oct 2026)
 Response:
 ```json
 {"users":[
@@ -72,7 +72,7 @@ Verify by capture before shipping.
 ## Project invitations
 
 ### `GET /v1/_projects/:id/invitations` — list pending invitations
-Auth: user
+Auth: project_user
 Response:
 ```json
 {"project_invitations":[
@@ -81,18 +81,18 @@ Response:
 ```
 
 ### `POST /v1/_projects/:id/invitations` — invite
-Auth: user
+Auth: project_user
 Request: `{"email":"<str>","role":"<str>"}`
 Response 201: `{"project_invitation":{"id":…,"email":…,"role":…,"created":…,"accepted":null,"expired":null}}`
 
 ### `PUT /v1/_projects/:id/invitations/:id/resend` — resend
-Auth: user
+Auth: project_user
 Request: none
 Response 204 no body
 Note: the method is **PUT**, not POST.
 
 ### `DELETE /v1/_projects/:id/invitations/:id` — revoke pending invite
-Auth: user
+Auth: project_user
 Response 204 no body
 
 ### Not supported by the API (verified)

@@ -37,10 +37,11 @@ func (c ProjectMemberClient) List(ctx context.Context, projectID int64, opts Pro
 		Meta  Meta             `json:"meta"`
 	}
 	err := c.client.do(ctx, request{
-		method: http.MethodGet,
-		path:   fmt.Sprintf("/_projects/%d/users", projectID),
-		query:  opts.values(),
-		auth:   authUser,
+		method:    http.MethodGet,
+		path:      fmt.Sprintf("/_projects/%d/users", projectID),
+		query:     opts.values(),
+		auth:      authProjectUser,
+		projectID: projectID,
 	}, &body)
 	if err != nil {
 		return nil, nil, err
