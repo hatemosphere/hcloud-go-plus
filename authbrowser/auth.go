@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
@@ -136,6 +137,9 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 	if err := chromedp.Do(ctx, chromedp.Navigate(buildAuthorizeURL())); err != nil {
 		return "", time.Time{}, fmt.Errorf("authbrowser: open authorize page: %w", err)
 	}
+	if err := waitForLoginPage(ctx); err != nil {
+		return "", time.Time{}, fmt.Errorf("authbrowser: login page never loaded (HeRay challenge stuck?): %w; page: %s", err, describePage(ctx))
+	}
 
 	// Fill username + password. Hetzner's login form uses name="_username"
 	// and name="_password" with a single submit button.
@@ -159,25 +163,23 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		return "", time.Time{}, fmt.Errorf("authbrowser: TOTP field not found (Yubikey OTP account, or login throttled?): %w; page: %s", err, describePage(ctx))
 	}
 
-	// Retry TOTP up to maxTOTPAttempts times. There are two failure modes
-	// we want to survive:
+	// Retry TOTP up to maxTOTPAttempts times. Hetzner accepts a code from
+	// the previous 30s window, but accepts each code only once: a second
+	// login of the same account inside one window (back-to-back logins,
+	// TokenSource refresh, a separate process such as a Terraform/Pulumi
+	// provider plugin, or another service sharing the robot account) gets
+	// the same code from the generator and is rejected — Hetzner just
+	// re-renders the 2FA form without an error message.
 	//
-	//  1. The code we generated lands on the wrong side of the 30-second
-	//     TOTP window boundary by the time Hetzner processes it. Retrying
-	//     with a fresh code fixes it — but only if the callback returns a
-	//     *new* code. Most secret managers (1Password, pass-otp, ykman)
-	//     generate deterministically from the seed + current time, so
-	//     repeated calls inside the same 30s window return the same code.
-	//     To avoid pounding the same rejected code three times in a row,
-	//     we compare the newly-fetched code against the one we last
-	//     submitted; if they match, we wait in small ticks (re-checking
-	//     up to ~35s) until the generator starts returning a different
-	//     code, signalling a new window.
+	// So before submitting we compare the code with the last one we
+	// submitted (in this login, or accepted by an earlier login in this
+	// process) and, if equal, poll the callback until the generator moves
+	// to the next window. Codes used by other processes can't be seen
+	// here; those cost one rejected attempt and then take the same path.
 	//
-	//  2. Transient form state: after a rejected submit, Hetzner may
-	//     briefly disable the submit button (pointer-events: none) while
-	//     it re-renders. We catch this with a bounded wait on the
-	//     submit button's clickability before each click.
+	// After a rejected submission Hetzner may briefly disable the submit
+	// button (pointer-events: none) while it re-renders; we wait for it to
+	// become clickable before each click.
 	const (
 		maxTOTPAttempts      = 3
 		waitNewCodeTimeout   = 35 * time.Second
@@ -185,8 +187,9 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		submitButtonReadyTmt = 5 * time.Second
 	)
 	totpAccepted := false
-	var lastCode string
+	lastCode := lastAcceptedCode.get()
 	for attempt := 1; attempt <= maxTOTPAttempts; attempt++ {
+		fetchStart := time.Now()
 		code, err := creds.TOTP(ctx)
 		if err != nil {
 			return "", time.Time{}, fmt.Errorf("authbrowser: TOTP callback: %w", err)
@@ -196,12 +199,9 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 			return "", time.Time{}, errors.New("authbrowser: TOTP callback returned empty code")
 		}
 
-		// On retry, if the callback returned the same code we just
-		// submitted, wait for the next 30s window before trying again.
-		// Otherwise we'd burn attempts on an already-rejected code.
-		if attempt > 1 && code == lastCode {
+		if code == lastCode {
 			if o.debug != nil {
-				fmt.Fprintln(o.debug, "[authbrowser] TOTP callback returned same code as previous attempt; waiting for next window")
+				fmt.Fprintln(o.debug, "[authbrowser] TOTP callback returned an already-used code; waiting for next window")
 			}
 			waitDeadline := time.Now().Add(waitNewCodeTimeout)
 			for time.Now().Before(waitDeadline) {
@@ -247,17 +247,19 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		}
 		lastCode = code
 		if o.debug != nil {
-			fmt.Fprintf(o.debug, "[authbrowser] submitted TOTP (attempt %d/%d)\n", attempt, maxTOTPAttempts)
+			fmt.Fprintf(o.debug, "[authbrowser] submitted TOTP (attempt %d/%d), window offset: fetch started %s, submitted %s\n",
+				attempt, maxTOTPAttempts, totpWindowOffset(fetchStart), totpWindowOffset(time.Now()))
 		}
 
 		// Success = we leave accounts.hetzner.com. Give it a short window.
 		if err := waitForHostChange(ctx, "accounts.hetzner.com", 8*time.Second); err == nil {
 			totpAccepted = true
+			lastAcceptedCode.set(code)
 			break
 		}
 
 		if o.debug != nil {
-			fmt.Fprintf(o.debug, "[authbrowser] TOTP attempt %d rejected (still on accounts.hetzner.com)\n", attempt)
+			fmt.Fprintf(o.debug, "[authbrowser] TOTP attempt %d rejected (still on accounts.hetzner.com); page: %s\n", attempt, describePage(ctx))
 		}
 		if err := waitTOTPField(ctx); err != nil {
 			return "", time.Time{}, fmt.Errorf("authbrowser: after TOTP submit, neither redirected nor TOTP form present: %w; page: %s", err, describePage(ctx))
@@ -292,16 +294,61 @@ const (
 	submitButton = chromedp.CSS(`button[type="submit"]`)
 )
 
+// lastAcceptedCode is the most recent TOTP code Hetzner accepted in this
+// process. Hetzner refuses to accept a code twice, so a later Login that
+// gets the same code back from its generator waits for the next window.
+var lastAcceptedCode usedCode
+
+type usedCode struct {
+	mu   sync.Mutex
+	code string
+}
+
+func (u *usedCode) get() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.code
+}
+
+func (u *usedCode) set(code string) {
+	u.mu.Lock()
+	u.code = code
+	u.mu.Unlock()
+}
+
 // ErrLoginThrottled is returned when accounts.hetzner.com refuses logins
 // with "too many login attempts" (observed: a 600s lockout after ~a dozen
 // logins in a short time). Retrying during the lockout does not help.
 var ErrLoginThrottled = errors.New("authbrowser: Hetzner login throttled (too many login attempts), wait ~10 minutes")
 
-// waitTOTPField waits for the TOTP input, failing fast on the throttle
-// banner. It leaves part of the overall budget for describePage when the
-// field never shows up.
+// waitForLoginPage waits until the /login document has finished loading.
+// The authorize URL first serves HeRay's proof-of-work page (/_ray/pow),
+// whose load event ends Navigate; about a second later it replaces itself
+// with /login, a new document. Touching the page in between races that
+// navigation and fails with "Could not find node with given id".
+func waitForLoginPage(ctx context.Context) error {
+	const probe = `location.host === "accounts.hetzner.com" && location.pathname === "/login" && document.readyState === "complete"`
+	for {
+		ok, _ := runWithin(ctx, time.Second, chromedp.Evaluate[bool](probe))
+		if ok {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// waitTOTPField waits until the 2FA document has finished loading and shows
+// the TOTP input, failing fast on the throttle banner. The 2FA form is a new
+// document after the credentials submit and after every rejected code, so
+// the same navigation race as on /login applies. It leaves part of the
+// overall budget for describePage when the field never shows up.
 func waitTOTPField(ctx context.Context) error {
-	const probe = `document.querySelector('input[name="_auth_code"]') ? "totp"
+	const probe = `document.readyState !== "complete" ? ""
+		: document.querySelector('input[name="_auth_code"]') ? "totp"
 		: (document.body && document.body.innerText.includes("too many login attempts") ? "throttled" : "")`
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -338,6 +385,12 @@ func describePage(ctx context.Context) string {
 		loc = u.Scheme + "://" + u.Host + u.Path // drop query/fragment, may carry OAuth state
 	}
 	return fmt.Sprintf("%s %q", loc, text)
+}
+
+// totpWindowOffset formats how far t is into its 30s TOTP window, for
+// debugging codes rejected at window boundaries.
+func totpWindowOffset(t time.Time) string {
+	return fmt.Sprintf("%.1fs/30s", float64(t.UnixMilli()%30000)/1000)
 }
 
 func clickSubmit(ctx context.Context) error {
