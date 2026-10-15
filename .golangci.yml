@@ -101,6 +101,8 @@ linters:
     presets:
       - common-false-positives
       - legacy
+      # fmt.Fprint* to the optional debug writer — nothing useful to do on error.
+      - std-error-handling
     rules:
       - path: _test\.go
         linters:

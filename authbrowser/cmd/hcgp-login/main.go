@@ -112,7 +112,7 @@ func credsFromEnv() (authbrowser.Credentials, error) {
 			Username: user,
 			Password: pass,
 			TOTP: func(ctx context.Context) (string, error) {
-				out, err := exec.CommandContext(ctx, "sh", "-c", cmd).Output()
+				out, err := exec.CommandContext(ctx, "sh", "-c", cmd).Output() //nolint:gosec // running the user-supplied HETZNER_TOTP_CMD is the point
 				if err != nil {
 					return "", fmt.Errorf("HETZNER_TOTP_CMD: %w", err)
 				}

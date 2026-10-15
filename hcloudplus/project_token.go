@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const tokensPath = "/_tokens"
+
 // ProjectToken is a project-scoped API token record as returned by
 // `GET /_tokens`. The secret string is NOT part of this type; it is only
 // returned once, from Create, in ProjectTokenCreateResult.Secret.
@@ -53,7 +55,7 @@ func (c ProjectTokenClient) List(ctx context.Context, projectID int64, opts Proj
 	}
 	err := c.client.do(ctx, request{
 		method:    http.MethodGet,
-		path:      "/_tokens",
+		path:      tokensPath,
 		query:     opts.values(),
 		auth:      authProjectUser,
 		projectID: projectID,
@@ -120,7 +122,7 @@ func (c ProjectTokenClient) Create(ctx context.Context, projectID int64, opts Pr
 	}
 	err := c.client.do(ctx, request{
 		method:    http.MethodPost,
-		path:      "/_tokens",
+		path:      tokensPath,
 		body:      reqBody,
 		auth:      authProjectUser,
 		projectID: projectID,

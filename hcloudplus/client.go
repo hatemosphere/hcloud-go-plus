@@ -350,7 +350,7 @@ func (c *Client) projectUserBearer(ctx context.Context, projectID int64) (string
 	var out mintResp
 	err := c.do(ctx, request{
 		method: http.MethodPost,
-		path:   "/_tokens",
+		path:   tokensPath,
 		body:   mintReq{Type: "project_user", Project: projectID},
 		auth:   authUser,
 	}, &out)
