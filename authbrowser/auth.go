@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/launcher"
-	"github.com/go-rod/rod/lib/proto"
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 )
 
 // OAuth parameters used by the Hetzner Cloud Console SPA. Mirrors the
@@ -71,8 +72,9 @@ type Option func(*Options)
 // Default is true. Pass false to watch the flow while debugging.
 func WithHeadless(v bool) Option { return func(o *Options) { o.headless = v } }
 
-// WithBrowserPath sets an explicit path to a Chromium binary. If unset,
-// go-rod will auto-download a pinned build on first use.
+// WithBrowserPath sets an explicit path to a Chrome/Chromium binary. If
+// unset, chromedp looks for an installed Chrome/Chromium in the usual
+// locations. Nothing is downloaded: containers must ship a browser.
 func WithBrowserPath(path string) Option { return func(o *Options) { o.browserPath = path } }
 
 // WithTimeout bounds the total time for the full login flow. Default 90s.
@@ -109,53 +111,41 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 	ctx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
 
-	// Launch Chromium.
-	l := launcher.New().
-		Headless(o.headless).
-		// Hetzner's login page sometimes rejects very small viewports
-		// during the HeRay challenge; keep the default and avoid --no-sandbox
-		// unless the caller explicitly opts in via env (HCGP_BROWSER_NOSANDBOX).
-		Set("disable-blink-features", "AutomationControlled")
+	// The browser lives as long as ctx: the deadline above kills it too.
+	allocOpts := []chromedp.ExecAllocatorOption{
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+	}
 	if o.browserPath != "" {
-		l = l.Bin(o.browserPath)
+		allocOpts = append(allocOpts, chromedp.ExecPath(o.browserPath))
 	}
-	controlURL, err := l.Launch()
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("authbrowser: launch chromium: %w", err)
+	if inContainer() {
+		// Containers usually run as root, where Chrome refuses to start
+		// with the sandbox enabled.
+		allocOpts = append(allocOpts, chromedp.NoSandbox)
 	}
-	defer l.Cleanup()
-
-	browser := rod.New().ControlURL(controlURL)
-	if err := browser.Connect(); err != nil {
-		return "", time.Time{}, fmt.Errorf("authbrowser: connect: %w", err)
+	ctxOpts := []chromedp.ContextOption{chromedp.WithAllocatorOptions(allocOpts...)}
+	if !o.headless {
+		ctxOpts = append(ctxOpts, chromedp.WithVisibleWindow())
 	}
-	defer browser.MustClose()
-
-	page, err := browser.Context(ctx).Page(proto.TargetCreateTarget{
-		URL: buildAuthorizeURL(),
-	})
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("authbrowser: open page: %w", err)
-	}
-	page = page.Context(ctx)
+	ctx, cancelBrowser := chromedp.NewContext(ctx, ctxOpts...)
+	defer cancelBrowser()
 
 	if o.debug != nil {
 		fmt.Fprintln(o.debug, "[authbrowser] navigating to authorize URL")
 	}
-
-	if err := page.WaitLoad(); err != nil {
-		return "", time.Time{}, fmt.Errorf("authbrowser: wait authorize page: %w", err)
+	if err := chromedp.Do(ctx, chromedp.Navigate(buildAuthorizeURL())); err != nil {
+		return "", time.Time{}, fmt.Errorf("authbrowser: open authorize page: %w", err)
 	}
 
 	// Fill username + password. Hetzner's login form uses name="_username"
 	// and name="_password" with a single submit button.
-	if err := setInput(page, `input[name="_username"]`, creds.Username); err != nil {
+	if err := chromedp.Do(ctx, chromedp.SendKeys(chromedp.CSS(`input[name="_username"]`), creds.Username)); err != nil {
 		return "", time.Time{}, fmt.Errorf("authbrowser: username: %w", err)
 	}
-	if err := setInput(page, `input[name="_password"]`, creds.Password); err != nil {
+	if err := chromedp.Do(ctx, chromedp.SendKeys(chromedp.CSS(`input[name="_password"]`), creds.Password)); err != nil {
 		return "", time.Time{}, fmt.Errorf("authbrowser: password: %w", err)
 	}
-	if err := clickSubmit(page); err != nil {
+	if err := clickSubmit(ctx); err != nil {
 		return "", time.Time{}, fmt.Errorf("authbrowser: submit credentials: %w", err)
 	}
 	if o.debug != nil {
@@ -165,8 +155,7 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 	// Wait for the TOTP input. If the account uses Yubikey OTP instead of
 	// TOTP, the `_auth_code` field won't appear and we'll hit the outer
 	// timeout with a clear error.
-	totpEl, err := page.Element(`input[name="_auth_code"]`)
-	if err != nil {
+	if err := chromedp.Do(ctx, chromedp.WaitVisible(totpField)); err != nil {
 		return "", time.Time{}, fmt.Errorf("authbrowser: TOTP field not found (is the account using Yubikey OTP instead of TOTP?): %w", err)
 	}
 
@@ -236,21 +225,24 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 			}
 		}
 
-		// Clear any leftover value from a previous rejected attempt before
-		// typing the new code.
-		if err := totpEl.SelectAllText(); err == nil {
-			_ = totpEl.Input("")
+		// Select any leftover value from a previous rejected attempt so the
+		// typed code replaces it. Setting .value directly is refused by the
+		// field. chromedp re-resolves the selector on every action, so a
+		// re-rendered form after a rejection is fine.
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](
+			`(() => { document.querySelector('input[name="_auth_code"]').select(); return true; })()`)); err != nil {
+			return "", time.Time{}, fmt.Errorf("authbrowser: select TOTP field: %w", err)
 		}
-		if err := totpEl.Input(code); err != nil {
+		if err := chromedp.Do(ctx, chromedp.SendKeys(totpField, code)); err != nil {
 			return "", time.Time{}, fmt.Errorf("authbrowser: input TOTP: %w", err)
 		}
 		// Wait for the submit button to be clickable — after a rejected
 		// submission Hetzner temporarily disables it (pointer-events: none)
 		// while re-rendering the form.
-		if err := waitForClickableSubmit(page, submitButtonReadyTmt); err != nil {
+		if err := waitForClickableSubmit(ctx, submitButtonReadyTmt); err != nil {
 			return "", time.Time{}, fmt.Errorf("authbrowser: submit button never became clickable: %w", err)
 		}
-		if err := clickSubmit(page); err != nil {
+		if err := clickSubmit(ctx); err != nil {
 			return "", time.Time{}, fmt.Errorf("authbrowser: submit TOTP: %w", err)
 		}
 		lastCode = code
@@ -259,7 +251,7 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		}
 
 		// Success = we leave accounts.hetzner.com. Give it a short window.
-		if err := waitForHostChange(ctx, page, "accounts.hetzner.com", 8*time.Second); err == nil {
+		if err := waitForHostChange(ctx, "accounts.hetzner.com", 8*time.Second); err == nil {
 			totpAccepted = true
 			break
 		}
@@ -267,10 +259,7 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		if o.debug != nil {
 			fmt.Fprintf(o.debug, "[authbrowser] TOTP attempt %d rejected (still on accounts.hetzner.com)\n", attempt)
 		}
-		// Re-acquire the TOTP element — Hetzner may have re-rendered the
-		// form with a new DOM node, invalidating the old handle.
-		totpEl, err = page.Element(`input[name="_auth_code"]`)
-		if err != nil {
+		if err := chromedp.Do(ctx, chromedp.WaitVisible(totpField)); err != nil {
 			return "", time.Time{}, fmt.Errorf("authbrowser: after TOTP submit, neither redirected nor TOTP form present: %w", err)
 		}
 	}
@@ -282,7 +271,7 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 	// OAuth fragment. The SPA parses the fragment and stores the token in
 	// the `tokens` cookie. Poll until the cookie appears or the context
 	// deadline fires.
-	token, expires, err = pollForTokenCookie(ctx, page, o.debug)
+	token, expires, err = pollForTokenCookie(ctx, o.debug)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -298,32 +287,41 @@ func buildAuthorizeURL() string {
 	return oauthAuthorizeURL + "?" + v.Encode()
 }
 
-func setInput(page *rod.Page, selector, value string) error {
-	el, err := page.Element(selector)
-	if err != nil {
-		return err
-	}
-	if err := el.SelectAllText(); err != nil {
-		// not fatal — selector may be empty
-	}
-	return el.Input(value)
+const (
+	totpField    = chromedp.CSS(`input[name="_auth_code"]`)
+	submitButton = chromedp.CSS(`button[type="submit"]`)
+)
+
+func clickSubmit(ctx context.Context) error {
+	return chromedp.Do(ctx, chromedp.Click(submitButton))
 }
 
-func clickSubmit(page *rod.Page) error {
-	btn, err := page.Element(`button[type="submit"]`)
-	if err != nil {
-		return err
+// inContainer mirrors go-rod's detection, which used to add --no-sandbox
+// for us.
+func inContainer() bool {
+	for _, f := range []string{"/.dockerenv", "/.containerenv"} {
+		if _, err := os.Stat(f); err == nil {
+			return true
+		}
 	}
-	return btn.Click(proto.InputMouseButtonLeft, 1)
+	return os.Getenv("KUBERNETES_SERVICE_HOST") != ""
+}
+
+// runWithin runs a with its own timeout so that a poll iteration can't hang
+// on a page that is mid-navigation.
+func runWithin[T any](ctx context.Context, d time.Duration, a chromedp.Action[T]) (T, error) {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	return chromedp.Run(ctx, a)
 }
 
 // waitForClickableSubmit blocks until `button[type="submit"]` has
 // `pointer-events: auto` (i.e. is actually clickable) or the timeout
 // elapses. Hetzner briefly sets pointer-events: none on the submit
 // button after a rejected TOTP while it re-renders the form, and
-// clicking during that window returns "element's pointer-events is none"
-// from rod — hence this pre-flight check on retries.
-func waitForClickableSubmit(page *rod.Page, timeout time.Duration) error {
+// clicking during that window is silently swallowed — hence this
+// pre-flight check on retries.
+func waitForClickableSubmit(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	tick := time.NewTicker(150 * time.Millisecond)
 	defer tick.Stop()
@@ -331,22 +329,24 @@ func waitForClickableSubmit(page *rod.Page, timeout time.Duration) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("authbrowser: submit button still disabled after %s", timeout)
 		}
-		el, err := page.Element(`button[type="submit"]`)
-		if err == nil {
-			pe, evalErr := el.Eval(`() => getComputedStyle(this).pointerEvents`)
-			if evalErr == nil && pe != nil && pe.Value.Str() != "none" {
-				return nil
-			}
+		ok, err := runWithin(ctx, time.Second, chromedp.Evaluate[bool](
+			`(() => { const b = document.querySelector('button[type="submit"]'); return !!b && getComputedStyle(b).pointerEvents !== 'none'; })()`))
+		if err == nil && ok {
+			return nil
 		}
-		<-tick.C
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
 	}
 }
 
-// waitForHostChange polls page.Info().URL until its host no longer
+// waitForHostChange polls the page location until its host no longer
 // contains `fromHost` (i.e. the page has navigated away), or returns an
 // error on timeout. Used to detect "did the form submission succeed"
 // without relying on content selectors that vary between error states.
-func waitForHostChange(ctx context.Context, page *rod.Page, fromHost string, timeout time.Duration) error {
+func waitForHostChange(ctx context.Context, fromHost string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
@@ -359,11 +359,11 @@ func waitForHostChange(ctx context.Context, page *rod.Page, fromHost string, tim
 		if time.Now().After(deadline) {
 			return fmt.Errorf("authbrowser: did not leave %s within %s", fromHost, timeout)
 		}
-		info, err := page.Info()
-		if err != nil || info == nil {
+		loc, err := runWithin(ctx, time.Second, chromedp.Location())
+		if err != nil {
 			continue
 		}
-		u, perr := url.Parse(info.URL)
+		u, perr := url.Parse(loc)
 		if perr != nil {
 			continue
 		}
@@ -376,7 +376,10 @@ func waitForHostChange(ctx context.Context, page *rod.Page, fromHost string, tim
 // pollForTokenCookie repeatedly reads the browser's cookies for the console
 // domain and returns the first entry of type "user" found in the `tokens`
 // cookie. It gives up when ctx expires.
-func pollForTokenCookie(ctx context.Context, page *rod.Page, debug io.Writer) (string, time.Time, error) {
+func pollForTokenCookie(ctx context.Context, debug io.Writer) (string, time.Time, error) {
+	getCookies := chromedp.Action[network.GetCookiesResult](func(ctx context.Context, t *chromedp.Target) (network.GetCookiesResult, error) {
+		return cdp.Call(ctx, t, network.GetCookies, network.GetCookiesParams{URLs: []string{"https://" + consoleDomain + "/"}})
+	})
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -386,14 +389,14 @@ func pollForTokenCookie(ctx context.Context, page *rod.Page, debug io.Writer) (s
 		case <-tick.C:
 		}
 
-		cookies, err := page.Cookies([]string{"https://" + consoleDomain + "/"})
+		res, err := runWithin(ctx, 2*time.Second, getCookies)
 		if err != nil {
 			if debug != nil {
 				fmt.Fprintf(debug, "[authbrowser] cookie read error: %v\n", err)
 			}
 			continue
 		}
-		for _, c := range cookies {
+		for _, c := range res.Cookies {
 			if c.Name != "tokens" || c.Value == "" {
 				continue
 			}

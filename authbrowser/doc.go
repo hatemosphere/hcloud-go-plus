@@ -1,10 +1,13 @@
 // Package authbrowser drives the Hetzner console OAuth implicit flow in a
-// headless Chromium (via go-rod) to obtain a user token from a robot-account
+// headless Chrome/Chromium (via chromedp) to obtain a user token from a robot-account
 // username + password + TOTP.
 //
 // Hetzner's OAuth login is gated by HeRay, a browser-side proof-of-work +
 // WebAssembly fingerprint challenge, so pure HTTP login is not possible. A
-// real browser environment must solve HeRay; we use go-rod to automate one.
+// real browser environment must solve HeRay; we use chromedp to automate one.
+//
+// A Chrome or Chromium binary must be installed (or passed via
+// WithBrowserPath); nothing is downloaded at runtime.
 //
 // Only TOTP 2FA is supported. See docs/2fa.md in the repository for the
 // rationale and for guidance on supported configurations (do not use this

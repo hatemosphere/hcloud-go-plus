@@ -69,11 +69,17 @@ The account-level token has to come from somewhere. Options:
 1. **Paste it from your browser** (one-shot use, human in the loop) — easy,
    useful during development. See the user token extraction steps in
    [`docs/private-api.md`](docs/private-api.md).
-2. **Use the `authbrowser` submodule** — drives a headless Chromium through
-   the real OAuth + MFA flow so your daemon / CLI / Pulumi provider /
-   Terraform provider can mint tokens unattended from robot credentials.
-   Opt-in, isolated `go.mod`, so consumers of the main package don't pay for
+2. **Use the `authbrowser` submodule** — drives a headless Chromium (via
+   [chromedp](https://github.com/chromedp/chromedp)) through the real
+   OAuth + MFA flow so your daemon / CLI / Pulumi provider / Terraform
+   provider can mint tokens unattended from robot credentials. Opt-in,
+   isolated `go.mod`, so consumers of the main package don't pay for
    Chromium transitively.
+
+   Needs an installed Chrome/Chromium (or `WithBrowserPath`); nothing is
+   downloaded at runtime. In containers, bake it into the image
+   (`apt-get install chromium` or the `chromedp/headless-shell` base);
+   `--no-sandbox` is added automatically when a container is detected.
 
    ```go
    import "github.com/hatemosphere/hcloud-go-plus/authbrowser"
