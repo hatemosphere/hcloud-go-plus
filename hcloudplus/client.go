@@ -35,7 +35,7 @@ const Endpoint = "https://api.hetzner.cloud/v1"
 const UserAgent = "hcloud-go-plus"
 
 // Version is a rough library version string; bump manually.
-const Version = "0.1.0"
+const Version = "0.1.1"
 
 // TokenSource produces (and optionally refreshes) an account-level user
 // token. Implementations must be safe for concurrent use.
