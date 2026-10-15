@@ -155,8 +155,8 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 	// Wait for the TOTP input. If the account uses Yubikey OTP instead of
 	// TOTP, the `_auth_code` field won't appear and we'll hit the outer
 	// timeout with a clear error.
-	if err := chromedp.Do(ctx, chromedp.WaitVisible(totpField)); err != nil {
-		return "", time.Time{}, fmt.Errorf("authbrowser: TOTP field not found (is the account using Yubikey OTP instead of TOTP?): %w", err)
+	if err := waitTOTPField(ctx); err != nil {
+		return "", time.Time{}, fmt.Errorf("authbrowser: TOTP field not found (Yubikey OTP account, or login throttled?): %w; page: %s", err, describePage(ctx))
 	}
 
 	// Retry TOTP up to maxTOTPAttempts times. There are two failure modes
@@ -259,8 +259,8 @@ func Login(ctx context.Context, creds Credentials, opts ...Option) (token string
 		if o.debug != nil {
 			fmt.Fprintf(o.debug, "[authbrowser] TOTP attempt %d rejected (still on accounts.hetzner.com)\n", attempt)
 		}
-		if err := chromedp.Do(ctx, chromedp.WaitVisible(totpField)); err != nil {
-			return "", time.Time{}, fmt.Errorf("authbrowser: after TOTP submit, neither redirected nor TOTP form present: %w", err)
+		if err := waitTOTPField(ctx); err != nil {
+			return "", time.Time{}, fmt.Errorf("authbrowser: after TOTP submit, neither redirected nor TOTP form present: %w; page: %s", err, describePage(ctx))
 		}
 	}
 	if !totpAccepted {
@@ -291,6 +291,54 @@ const (
 	totpField    = chromedp.CSS(`input[name="_auth_code"]`)
 	submitButton = chromedp.CSS(`button[type="submit"]`)
 )
+
+// ErrLoginThrottled is returned when accounts.hetzner.com refuses logins
+// with "too many login attempts" (observed: a 600s lockout after ~a dozen
+// logins in a short time). Retrying during the lockout does not help.
+var ErrLoginThrottled = errors.New("authbrowser: Hetzner login throttled (too many login attempts), wait ~10 minutes")
+
+// waitTOTPField waits for the TOTP input, failing fast on the throttle
+// banner. It leaves part of the overall budget for describePage when the
+// field never shows up.
+func waitTOTPField(ctx context.Context) error {
+	const probe = `document.querySelector('input[name="_auth_code"]') ? "totp"
+		: (document.body && document.body.innerText.includes("too many login attempts") ? "throttled" : "")`
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		state, _ := runWithin(ctx, time.Second, chromedp.Evaluate[string](probe))
+		switch state {
+		case "totp":
+			return nil
+		case "throttled":
+			return ErrLoginThrottled
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return errors.New("timed out after 30s")
+}
+
+// describePage returns the URL and the start of the visible text of the
+// page, so failures say what Hetzner showed instead of just timing out.
+// Input values are not part of innerText, so credentials do not leak.
+func describePage(ctx context.Context) string {
+	loc, err := runWithin(ctx, 3*time.Second, chromedp.Location())
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	text, _ := runWithin(ctx, 3*time.Second, chromedp.Evaluate[string](`document.body ? document.body.innerText : ""`))
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 300 {
+		text = text[:300] + "..."
+	}
+	if u, err := url.Parse(loc); err == nil {
+		loc = u.Scheme + "://" + u.Host + u.Path // drop query/fragment, may carry OAuth state
+	}
+	return fmt.Sprintf("%s %q", loc, text)
+}
 
 func clickSubmit(ctx context.Context) error {
 	return chromedp.Do(ctx, chromedp.Click(submitButton))
